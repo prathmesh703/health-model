@@ -1,118 +1,130 @@
-import pandas as pd
 import torch
-from datasets import Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from datasets import load_dataset
+import pandas as pd
+import os
 
 # --- Configuration ---
-MODEL_ID = "distilgpt2"  # A smaller model for local training. For better results, consider larger models if you have the hardware.
-DATA_PATH = "data.csv"
+MODEL_ID = "distilgpt2"
+DATA_PATH = "data.csv"  # Make sure your CSV file is named this
 OUTPUT_DIR = "healthcare_lora_model"
-LORA_R = 8
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.05
 
-def load_and_prepare_data(filepath, tokenizer):
-    """Loads data from a CSV, formats it into prompts, and tokenizes it."""
-    df = pd.read_csv(filepath)
+# --- Functions ---
 
-    # We need to format our structured data into a string that the model can understand.
-    # We'll create a prompt template.
+def load_and_prepare_data(data_path, tokenizer):
+    """Loads data, creates prompts, and tokenizes it."""
+    try:
+        # Use the name of your training data file
+        df = pd.read_csv("data.csv") 
+    except FileNotFoundError:
+        print(f"Error: The file 'data.csv' was not found.")
+        print("Please make sure your training data CSV is in the same folder and has the correct name.")
+        exit()
+
     def create_prompt(row):
-        return f"""### INSTRUCTION:
-Analyze the following patient data and provide a summary of potential issues.
+        """Creates a formatted prompt for each row of data."""
+        return f"""<s>[INST] Analyze the following patient data: {row['data']} [/INST]
+        {row['diagnosis']}</s>"""
 
-### DATA:
-{row['data']}
-
-### ANALYSIS:
-{row['analysis']}"""
-
+    print("Formatting data into prompts...")
     df['text'] = df.apply(create_prompt, axis=1)
+    
+    # Save the dataframe with the new 'text' column to a temporary file for the dataset loader
+    temp_csv_path = "temp_processed_data.csv"
+    df.to_csv(temp_csv_path, index=False)
+    
+    # Create a Dataset object from our processed text
+    data = load_dataset('csv', data_files={'train': temp_csv_path})
+    
+    # Tokenize the 'text' column
+    data = data.map(lambda samples: tokenizer(samples['text'], truncation=True, max_length=512, padding="max_length"), batched=True)
+    
+    # Cleanup the temporary file
+    os.remove(temp_csv_path)
+    
+    return data['train']
 
-    # Convert pandas DataFrame to Hugging Face Dataset
-    dataset = Dataset.from_pandas(df)
-
-    # Tokenize the dataset
-    def tokenize_function(examples):
-        return tokenizer(examples['text'], truncation=True, padding='max_length', max_length=512)
-
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset.column_names)
-
-    return tokenized_dataset
 
 def main():
+    """Main function to run the fine-tuning process."""
     print("--- Starting Healthcare Model Fine-Tuning ---")
 
-    # --- 1. Load Tokenizer and Model ---
-    print(f"Loading base model: {MODEL_ID}")
+    # Load Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    tokenizer.pad_token = tokenizer.eos_token # Set pad token
+    tokenizer.pad_token = tokenizer.eos_token # Set padding token
 
-    # Load model with quantization for memory efficiency
+    # Quantization Config for memory efficiency
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    # Load Base Model
+    print(f"Loading base model: {MODEL_ID}")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        load_in_8bit=True, # Use 8-bit quantization
-        device_map="auto", # Automatically map model to available devices (GPU/CPU)
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
     )
-
-    # --- 2. Prepare Data ---
+    model.config.use_cache = False
+    model.config.pretraining_tp = 1
+    
+    # Load and prepare data
     print(f"Loading and preparing data from: {DATA_PATH}")
-    tokenized_data = load_and_prepare_data(DATA_PATH, tokenizer)
+    # Pass the correct filename to the function
+    tokenized_data = load_and_prepare_data("data.csv", tokenizer)
 
-    # --- 3. Configure LoRA ---
-    print("Configuring LoRA...")
-    # Prepare model for k-bit training
-    model = prepare_model_for_kbit_training(model)
-
+    # LoRA Configuration
     lora_config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
         bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=["c_attn", "c_proj", "c_fc"] # Target modules can vary depending on the model architecture
+        task_type="CAUSAL_LM", # Corrected the typo here
     )
 
-    # Wrap the model with PEFT model
+    # Prepare model for training
+    model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
 
-    # --- 4. Set up Training ---
+    # Training Arguments
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=3,           # Number of training epochs
-        per_device_train_batch_size=2, # Batch size per device during training
-        gradient_accumulation_steps=1,
+        per_device_train_batch_size=1, # Reduced for stability
+        gradient_accumulation_steps=4, # Increased for stability
         learning_rate=2e-4,
-        logging_dir='./logs',
+        num_train_epochs=25, # Increased epochs for better learning on small data
+        logging_dir=f"{OUTPUT_DIR}/logs",
         logging_steps=5,
         save_steps=50,
-        fp16=False, # Set to True if you have a GPU that supports it
-        # You might need to adjust these parameters based on your hardware
+        fp16=False, # Set to False for CPU training
+        optim="adamw_torch", # Changed from "paged_adamw_8bit"
     )
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
+    # Initialize Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_data,
-        tokenizer=tokenizer,
-        data_collator=data_collator
+        data_collator=lambda data: {'input_ids': torch.tensor([f['input_ids'] for f in data]),
+                                    'attention_mask': torch.tensor([f['attention_mask'] for f in data]),
+                                    'labels': torch.tensor([f['input_ids'] for f in data])}
     )
 
-    # --- 5. Start Training ---
-    print("Starting model training...")
+    # Train the model
+    print("--- Starting Training ---")
     trainer.train()
-    print("Training complete.")
+    print("--- Training Finished ---")
 
-    # --- 6. Save the trained LoRA adapter ---
-    print(f"Saving LoRA adapter to {OUTPUT_DIR}")
-    model.save_pretrained(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    print("--- Fine-Tuning Process Finished ---")
-
+    # Save the fine-tuned model
+    print(f"Saving fine-tuned model to {OUTPUT_DIR}")
+    trainer.save_model(OUTPUT_DIR)
+    print("--- Model Saved ---")
 
 if __name__ == "__main__":
     main()
+
