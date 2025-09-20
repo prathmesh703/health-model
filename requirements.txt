@@ -1,0 +1,9 @@
+transformers 
+peft
+accelerate
+bitsandbytes
+torch
+pandas
+datasets
+scipy
+sentencepiece
